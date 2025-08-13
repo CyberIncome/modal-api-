@@ -46,6 +46,7 @@ with image.imports():
     from PIL import Image
     from fastapi import FastAPI, File, UploadFile, Form, HTTPException
     from fastapi.responses import Response
+    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 @app.cls(
     image=image,
@@ -76,40 +77,51 @@ class FluxKontextModel:
     @modal.method()
     def inference(
         self,
-        image_bytes: bytes,
         prompt: str,
+        image_bytes: Optional[bytes] = None,
         width: int = 1024,
         height: int = 1024,
         guidance_scale: float = 3.5,
         num_inference_steps: int = 20,
         seed: Optional[int] = None,
     ) -> bytes:
-        # Use provided seed or generate a random one
+        # Set seed
         if seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
         else:
             generator = torch.Generator(device=self.device)
 
-        init_image = load_image(Image.open(BytesIO(image_bytes)))
+        # Editing mode
+        if image_bytes:
+            init_image = load_image(Image.open(BytesIO(image_bytes)))
+            result = self.pipe(
+                image=init_image,
+                prompt=prompt,
+                width=width,
+                height=height,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_inference_steps,
+                output_type="pil",
+                generator=generator,
+            )
+        else:
+            # Generation mode
+            result = self.pipe(
+                prompt=prompt,
+                width=width,
+                height=height,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_inference_steps,
+                output_type="pil",
+                generator=generator,
+            )
 
-        image = self.pipe(
-            width=width,
-            height=height,
-            image=init_image,
-            prompt=prompt,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_inference_steps,
-            output_type="pil",
-            generator=generator,
-        ).images[0]
-
+        image = result.images[0]
         byte_stream = BytesIO()
         image.save(byte_stream, format="PNG")
-        image_bytes = byte_stream.getvalue()
+        return byte_stream.getvalue()
 
-        return image_bytes
-
-# Create a separate FastAPI app to handle the web interface
+# FastAPI web interface
 @app.function(image=image, volumes=volumes, secrets=secrets, cpu="0.5", memory="2GiB")
 @modal.asgi_app()
 def fastapi_app():
@@ -118,34 +130,26 @@ def fastapi_app():
     from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
     from PIL import Image
     from io import BytesIO
+    import os
 
     web_app = FastAPI(
-        title="Flux Kontext Image Editor",
-        description="Edit images using Flux Kontext Dev model",
+        title="Flux Kontext Generator & Editor",
+        description="Generate or edit images using Flux Kontext Dev model",
         version="1.0.0",
     )
 
-    @web_app.post("/edit_image")
-    async def edit_image(
-        image: UploadFile = File(..., description="Input image file"),
-        prompt: str = Form(..., description="Text prompt describing the desired edit"),
+    @web_app.post("/generate_or_edit")
+    async def generate_or_edit(
+        prompt: str = Form(..., description="Prompt for generation/editing"),
+        image: Optional[UploadFile] = File(None, description="Optional input image"),
         token: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
-        guidance_scale: float = Form(
-            3.5, description="Guidance scale (higher = more prompt adherence)"
-        ),
-        num_inference_steps: int = Form(20, description="Number of inference steps"),
-        seed: int = Form(None, description="Random seed for reproducible results"),
+        guidance_scale: float = Form(3.5),
+        num_inference_steps: int = Form(20),
+        seed: Optional[int] = Form(None),
+        width: Optional[int] = Form(1024),
+        height: Optional[int] = Form(1024),
     ):
-        """
-        Edit an image using Flux Kontext Dev model.
-
-        - **image**: Upload an image file (PNG, JPG, JPEG)
-        - **prompt**: Text description of how you want to edit the image
-        - **guidance_scale**: Controls how closely the model follows the prompt (default: 3.5)
-        - **num_inference_steps**: Number of denoising steps (default: 20)
-        - **seed**: Optional seed for reproducible results
-        """
-        
+        # Optional auth check
         if os.environ.get("BEARER_TOKEN", False):
             if not token or token.credentials != os.environ["BEARER_TOKEN"]:
                 raise HTTPException(
@@ -153,110 +157,66 @@ def fastapi_app():
                     detail="Incorrect bearer token",
                     headers={"WWW-Authenticate": "Bearer"},
                 )
-            
-        
-        try:
+
+        image_bytes = None
+        if image:
             if image.content_type not in ["image/png", "image/jpeg", "image/jpg"]:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid file type. Please upload a PNG or JPEG image.",
-                )
-
+                raise HTTPException(status_code=400, detail="Invalid file type")
             image_bytes = await image.read()
+            if len(image_bytes) > 10 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail="Image file too large (max 10MB)")
 
-            # Validate image size
-            if len(image_bytes) > 10 * 1024 * 1024:  # 10MB limit
-                raise HTTPException(
-                    status_code=400,
-                    detail="Image file too large. Please upload an image smaller than 10MB.",
-                )
+        model = FluxKontextModel()
+        result_bytes = model.inference.remote(
+            prompt=prompt,
+            image_bytes=image_bytes,
+            width=width,
+            height=height,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            seed=seed,
+        )
 
-            pil_image = Image.open(BytesIO(image_bytes))
-            width, height = pil_image.size
-            
-            aspect_ratio_float = width / height
-            # https://docs.bfl.ai/kontext/kontext_text_to_image#flux-1-kontext-text-to-image-parameters
-            min_ratio = 3 / 7
-            max_ratio = 7 / 3
-            
-            if aspect_ratio_float < min_ratio or aspect_ratio_float > max_ratio:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid aspect ratio. Image aspect ratio ({width}:{height}) must be between 3:7 and 7:3. Current ratio: {aspect_ratio_float:.2f}",
-                )
-
-            model = FluxKontextModel()
-            result_bytes = model.inference.remote(
-                width=width,
-                height=height,
-                image_bytes=image_bytes,
-                prompt=prompt,
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_inference_steps,
-                seed=seed,
-            )
-
-            return Response(
-                content=result_bytes,
-                media_type="image/png",
-                headers={"Content-Disposition": "inline; filename=edited_image.png"},
-            )
-
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Error processing image: {str(e)}"
-            )
+        return Response(
+            content=result_bytes,
+            media_type="image/png",
+            headers={"Content-Disposition": "inline; filename=result.png"},
+        )
 
     return web_app
 
-
-# ## CLI Interface
-# You can test the model locally using the CLI interface.
-# Run with: modal run flux_fastapi.py --prompt "your prompt here" --image-path "path/to/image.jpg" --output-path "path/to/output.jpg"
+# CLI local test
 @app.local_entrypoint()
 def main(
-    image_path: str = "demo_images/dog.png",
-    output_path: str = "/tmp/edited_image.png",
-    prompt: str = "A cute dog wizard inspired by Gandalf from Lord of the Rings, featuring detailed fantasy elements in Studio Ghibli style",
+    prompt: str = "A fantasy castle at sunset",
+    image_path: Optional[str] = None,
+    output_path: str = "/tmp/output.png",
+    width: int = 1024,
+    height: int = 1024,
     guidance_scale: float = 3.5,
     num_inference_steps: int = 20,
     seed: Optional[int] = None,
 ):
-    """
-    Test the Flux Kontext model locally via CLI.
-    """
-    print(f"🎨 Reading input image from {image_path}")
+    print(f"🎨 Prompt: {prompt}")
 
-    try:
-        input_image_bytes = Path(image_path).read_bytes()
-    except FileNotFoundError:
-        print(f"❌ Error: Image file not found at {image_path}")
-        return
-
-    pil_image = Image.open(BytesIO(input_image_bytes))
-    width, height = pil_image.size
-
-    aspect_ratio_float = width / height
-    # https://docs.bfl.ai/kontext/kontext_text_to_image#flux-1-kontext-text-to-image-parameters
-    min_ratio = 3 / 7
-    max_ratio = 7 / 3
-
-    if aspect_ratio_float < min_ratio or aspect_ratio_float > max_ratio:
-        print(f"❌ Error: Invalid aspect ratio. Image aspect ratio ({width}:{height}) must be between 3:7 and 7:3. Current ratio: {aspect_ratio_float:.2f}")
-        return
-
-    print(f"🎨 Editing image with prompt: {prompt}")
+    image_bytes = None
+    if image_path:
+        try:
+            image_bytes = Path(image_path).read_bytes()
+        except FileNotFoundError:
+            print(f"❌ Image file not found at {image_path}")
+            return
 
     model = FluxKontextModel()
-    output_image_bytes = model.inference.remote(
-        image_bytes=input_image_bytes,
+    result_bytes = model.inference.remote(
         prompt=prompt,
+        image_bytes=image_bytes,
+        width=width,
+        height=height,
         guidance_scale=guidance_scale,
         num_inference_steps=num_inference_steps,
         seed=seed,
     )
 
-    print(f"🎨 Saving output image to {output_path}")
-    output_path.write_bytes(output_image_bytes)
-
-    print("✅ Image editing completed successfully!")
+    Path(output_path).write_bytes(result_bytes)
+    print(f"✅ Saved result → {output_path}")
